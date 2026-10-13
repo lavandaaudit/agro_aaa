@@ -128,7 +128,10 @@ let globalState = {
     activeUaFilter: 'all',
     activeEnFilter: 'all',
     countdown: 60,
-    lastSensorData: {}
+    lastSensorData: {},
+    sitSources: {},          // нові реальні джерела ситуативного центру: { nasa, air, flood, wb }
+    _sitExtrasSig: '',       // регіон останнього збору нових джерел
+    _sitExtrasTs: 0          // час останнього збору (тротлінг 5 хв)
 };
 
 // ==============================================================
@@ -270,10 +273,12 @@ async function fetchNbuDateRates(ymd) {
 }
 
 // Реальна історія офіційних курсів НБУ:
-//   results[0] = 7 днів тому (для реальної динаміки), решта — точки спарклайна (12/10/8/6/4/2 дні тому + сьогодні)
+//   results[0] = 7 днів тому (для реальної динаміки), решта — точки спарклайна (12/10/8/6/4/2 дні тому + сьогодні),
+//   14/21/28 — реальна волатильність курсу USD за місяць (для Агро-індексу)
 async function fetchNbuHistory() {
     if (globalState.nbuHistorySeries) return; // курс НБУ змінюється раз на добу — історію тягнемо один раз за сесію
-    const offsets = [7, 12, 10, 8, 6, 4, 2];
+    // 7…28 днів тому — динаміка тікера + реальна волатильність USD за 30 днів для Агро-індексу
+    const offsets = [7, 12, 10, 8, 6, 4, 2, 14, 21, 28];
     const results = await Promise.all(offsets.map(off => {
         const d = new Date(Date.now() - off * 86400000);
         return fetchNbuDateRates(d.toISOString().slice(0, 10).replace(/-/g, ''));
@@ -1284,7 +1289,15 @@ async function updatePrecisionSensors(lat, lng) {
             vpd:          data.current?.vapour_pressure_deficit ?? null,
             soilMoisture: data.hourly?.soil_moisture_9_to_27cm?.[0] ?? null,
             et0:          data.current?.et0_fao_evapotranspiration ?? null,
-            windSpeed:    data.current?.wind_speed_10m ?? null
+            windSpeed:    data.current?.wind_speed_10m ?? null,
+            // додаткові реальні поля з того самого запиту (без нових викликів API)
+            soilTemp:     data.hourly?.soil_temperature_6cm?.[0] ?? null,
+            precipWindow: Array.isArray(data.daily?.precipitation_sum)
+                ? data.daily.precipitation_sum.reduce((a, v) => a + (v ?? 0), 0) : null,
+            radWindow: (() => {
+                const arr = (data.daily?.shortwave_radiation_sum || []).filter(v => v != null);
+                return arr.length ? arr.reduce((a, v) => a + v, 0) / arr.length : null;
+            })()
         };
 
         // Реальна сума ефективних температур (GDD, база +5°C) за 7 днів з денних max/min Open-Meteo
@@ -1314,6 +1327,10 @@ async function updatePrecisionSensors(lat, lng) {
                 `<strong>Open-Meteo (${lat.toFixed(2)}, ${lng.toFixed(2)}):</strong> t=${t != null ? (t > 0 ? '+' : '') + t.toFixed(1) : '—'}°C · RH=${h != null ? h.toFixed(0) : '—'}% · ґрунт=${mst != null ? mst.toFixed(2) : '—'} m³/m³`
             );
         }
+
+        // Нові реальні джерела ситуативного центру (NASA POWER · CAMS Air · GloFAS · World Bank)
+        // — з тротлінгом 5 хв і миттєво при зміні регіону
+        fetchSituationalExtras(lat, lng);
     } catch (e) {
         console.error('[OPEN-METEO] Sensor update failed:', e);
     }
@@ -1864,8 +1881,9 @@ function initSituationalCenter() {
     computeAndDisplayAgroIndex();
     renderEventLog();
     updateAlertCardsFromSensors();
+    fetchSituationalExtras(globalState.currentRegion.lat, globalState.currentRegion.lng);
 
-    addEventLog('info', '<strong>Ситуаційний центр активний.</strong> Джерела: НБУ (bank.gov.ua) · Open-Meteo · Sentinel-2 NDVI — тільки реальні дані');
+    addEventLog('info', '<strong>Ситуаційний центр активний.</strong> Джерела: НБУ · Open-Meteo · NASA POWER · CAMS Air Quality · GloFAS · World Bank · Sentinel-2 NDVI — тільки реальні дані');
 
     // Refresh every 5 minutes
     setInterval(() => {
@@ -1875,10 +1893,186 @@ function initSituationalCenter() {
     }, 5 * 60 * 1000);
 }
 
+// ==============================================================
+// 9a. НОВІ РЕАЛЬНІ ДЖЕРЕЛА СИТУАТИВНОГО ЦЕНТРУ (без ключів, CORS відкритий)
+//     ☀️ NASA POWER (power.larc.nasa.gov) — супутникова сонячна радіація/опади
+//     🌫️ CAMS Air Quality (air-quality-api.open-meteo.com) — пил/AOD/PM2.5
+//     🌊 GloFAS (flood-api.open-meteo.com) — річковий стік, повінева небезпека
+//     🏛️ World Bank (api.worldbank.org) — офіційні річні агро-індикатори
+// ==============================================================
+
+// Кліматичні норми сумарної сонячної радіації для України, МДж/м²·день (довідник — база для нормалізації, саме значення завжди реальне з NASA POWER)
+const SOLAR_NORM_UA = [2.6, 4.8, 8.7, 13.6, 17.9, 19.6, 18.9, 16.2, 11.9, 7.3, 3.4, 2.2];
+
+let _sitExtrasBusy = false;
+
+async function fetchSituationalExtras(lat, lng, force = false) {
+    if (_sitExtrasBusy) return;
+    const sig = `${lat.toFixed(2)},${lng.toFixed(2)}`;
+    const now = Date.now();
+    if (!force && globalState._sitExtrasSig === sig && now - globalState._sitExtrasTs < 5 * 60 * 1000) return;
+    _sitExtrasBusy = true;
+    globalState._sitExtrasSig = sig;
+    globalState._sitExtrasTs = now;
+
+    await Promise.allSettled([
+        fetchNasaSolar(lat, lng),
+        fetchAirQuality(lat, lng),
+        fetchFlood(lat, lng),
+        fetchWorldBankAgri()
+    ]);
+
+    _sitExtrasBusy = false;
+    computeAndDisplayAgroIndex(); // перерахунок індексу + AI-звіту з новими реальними даними
+}
+
+// ☀️ NASA POWER — денні супутникові дані за останні 5 доступних днів (API відстає на кілька днів — беремо вікно до вчора)
+async function fetchNasaSolar(lat, lng) {
+    try {
+        const end = new Date(Date.now() - 86400000);
+        const start = new Date(Date.now() - 6 * 86400000);
+        const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+        const url = `https://power.larc.nasa.gov/api/temporal/daily/point?parameters=ALLSKY_SFC_SW_DWN,PRECTOTCORR,T2M,RH2M&community=AG&longitude=${lng.toFixed(3)}&latitude=${lat.toFixed(3)}&start=${fmt(start)}&end=${fmt(end)}&format=JSON`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(25000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        const p = j?.properties?.parameter || {};
+        // -999 = пропуск у NASA → фільтруємо
+        const radObj = p.ALLSKY_SFC_SW_DWN || {};
+        const days = Object.keys(radObj).filter(k => radObj[k] > -900).sort();
+        if (!days.length) throw new Error('немає валідних днів');
+        const radMean = days.reduce((a, k) => a + radObj[k], 0) / days.length;
+        const lastDay = days[days.length - 1];
+        const precObj = p.PRECTOTCORR || {};
+        const precipDays = Object.keys(precObj).filter(k => precObj[k] > -900);
+        const precipSum = precipDays.reduce((a, k) => a + (precObj[k] || 0), 0);
+
+        globalState.sitSources.nasa = {
+            status: 'live', ts: Date.now(),
+            data: {
+                radMean, days: days.length, lastDay,
+                radLast: radObj[lastDay],
+                precipSum, daysN: precipDays.length,
+                t2mLast: p.T2M?.[lastDay] ?? null, rhLast: p.RH2M?.[lastDay] ?? null
+            }
+        };
+        addEventLog('ok', `<strong>NASA POWER:</strong> радіація ${radMean.toFixed(1)} МДж/м²·день (середнє за ${days.length} дн., супутник) · опади ${precipSum.toFixed(1)} мм`);
+        computeAndDisplayAgroIndex(); // звіт оновлюється одразу по прибутті джерела, не чекаючи решту
+    } catch (e) {
+        globalState.sitSources.nasa = { status: 'offline', err: e.message };
+        console.warn('[NASA POWER]', e.message);
+    }
+}
+
+// 🌫️ CAMS Air Quality — поточний пил, аерозоль, PM
+async function fetchAirQuality(lat, lng) {
+    try {
+        const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat.toFixed(3)}&longitude=${lng.toFixed(3)}&current=aerosol_optical_depth,dust,pm2_5,pm10&timezone=auto`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        const c = j.current || {};
+        globalState.sitSources.air = {
+            status: 'live', ts: Date.now(),
+            data: {
+                aod: c.aerosol_optical_depth ?? null,
+                dust: c.dust ?? null,
+                pm25: c.pm2_5 ?? null,
+                pm10: c.pm10 ?? null,
+                time: c.time ?? null
+            }
+        };
+        addEventLog('ok', `<strong>CAMS Air Quality:</strong> пил ${c.dust ?? 0} мкг/м³ · AOD ${c.aerosol_optical_depth ?? '—'} · PM2.5 ${c.pm2_5 ?? '—'} мкг/м³`);
+        computeAndDisplayAgroIndex();
+    } catch (e) {
+        globalState.sitSources.air = { status: 'offline', err: e.message };
+        console.warn('[CAMS AIR]', e.message);
+    }
+}
+
+// 🌊 GloFAS — річковий стік: минулі 3 дні + прогноз 4 дні (м³/с)
+async function fetchFlood(lat, lng) {
+    try {
+        const url = `https://flood-api.open-meteo.com/v1/flood?latitude=${lat.toFixed(3)}&longitude=${lng.toFixed(3)}&daily=river_discharge_mean&past_days=3&forecast_days=4&timezone=auto`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        const arr = j.daily?.river_discharge_mean || [];
+        const times = j.daily?.time || [];
+        const past = arr.slice(0, 3).filter(v => v != null);
+        const fc = arr.slice(3).filter(v => v != null);
+        const pastMax = past.length ? Math.max(...past) : null;
+        const fcMax = fc.length ? Math.max(...fc) : null;
+        let fcMaxDay = null;
+        if (fc.length && fcMax != null) {
+            const idx = arr.slice(3).indexOf(fcMax);
+            fcMaxDay = times[3 + idx] ?? null;
+        }
+        globalState.sitSources.flood = {
+            status: 'live', ts: Date.now(),
+            data: { pastMax, fcMax, fcMaxDay, pastLast: past.length ? past[past.length - 1] : null }
+        };
+        addEventLog('ok', `<strong>GloFAS:</strong> річковий стік макс ${pastMax ?? '—'} м³/с (3 дн. тому) → прогноз ${fcMax ?? '—'} м³/с`);
+        computeAndDisplayAgroIndex();
+    } catch (e) {
+        globalState.sitSources.flood = { status: 'offline', err: e.message };
+        console.warn('[GLOFAS]', e.message);
+    }
+}
+
+// 🏛️ World Bank — офіційні річні індикатори України (раз на сесію; річні дані)
+async function fetchWorldBankAgri() {
+    if (globalState.sitSources.wb?.status === 'live') return;
+    const tryFetch = async () => {
+        const fetchInd = async (ind) => {
+            const res = await fetch(`https://api.worldbank.org/v2/country/UKR/indicator/${ind}?format=json&per_page=10`, { signal: AbortSignal.timeout(25000) });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const j = await res.json();
+            return (Array.isArray(j) && Array.isArray(j[1]) ? j[1] : []).filter(x => x.value != null).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        };
+        // серійно: спершу зернові (головний вхід індексу), потім решта паралельно — WB не любить пачки одночасних запитів
+        const rows = await fetchInd('AG.PRD.CREL.MT');
+        const [fert, agriGdp] = await Promise.allSettled([fetchInd('AG.CON.FERT.ZS'), fetchInd('NV.AGR.TOTL.ZS')]);
+        return { rows, fert, agriGdp };
+    };
+    try {
+        let out;
+        try {
+            out = await tryFetch();
+        } catch (e1) {
+            await new Promise(r => setTimeout(r, 2000)); // одна повторна спроба
+            out = await tryFetch();
+        }
+        const rows = out.rows;
+        if (!rows.length) throw new Error('немає значень');
+        const last = rows[rows.length - 1], prev = rows.length > 1 ? rows[rows.length - 2] : null;
+        const yoy = prev ? (last.value - prev.value) / prev.value * 100 : null;
+        const fertLast = out.fert.status === 'fulfilled' && out.fert.value.length ? out.fert.value[out.fert.value.length - 1] : null;
+        const gdpLast = out.agriGdp.status === 'fulfilled' && out.agriGdp.value.length ? out.agriGdp.value[out.agriGdp.value.length - 1] : null;
+
+        globalState.sitSources.wb = {
+            status: 'live', ts: Date.now(),
+            data: {
+                cerealLast: last.value, cerealYear: last.date, cerealYoY: yoy,
+                fert: fertLast ? { val: fertLast.value, year: fertLast.date } : null,
+                agriGdp: gdpLast ? { val: gdpLast.value, year: gdpLast.date } : null
+            }
+        };
+        addEventLog('ok', `<strong>World Bank:</strong> зернові ${(last.value / 1e6).toFixed(1)} млн т (${last.date})${yoy != null ? `, ${yoy >= 0 ? '+' : ''}${yoy.toFixed(1)}% рік-до-року` : ''}`);
+        computeAndDisplayAgroIndex();
+    } catch (e) {
+        globalState.sitSources.wb = { status: 'offline', err: e.message };
+        console.warn('[WORLD BANK]', e.message);
+    }
+}
+
 function computeAndDisplayAgroIndex() {
-    // АГРО-ІНДЕКС БЕЗ СИМУЛЯЦІЙ: тільки реальні вхідні дані
-    // (Open-Meteo · Sentinel-2 NDVI · офіційний курс НБУ). Жодних Math.random().
+    // АГРО-ІНДЕКС v2 — 8 КОМПОНЕНТІВ, ТОЛЬКИ РЕАЛЬНІ ДАНІ:
+    // Open-Meteo (клімат/ґрунт) · NASA POWER (радіація) · CAMS (повітря) · GloFAS (річки) ·
+    // НБУ (валюта, 30д волатильність) · World Bank (агро-макро) · Sentinel-2 NDVI (довідковий).
+    // Жодних Math.random(). Відсутні дані → компонент «—» і вага перерозподіляється між рештою.
     const s = globalState.lastSensorData || {};
+    const src = globalState.sitSources || {};
     const ndvi = SAT_REGIONS[currentSatRegion]?.ndvi ?? null;
 
     // 1. Агроклімат — реальні показники Open-Meteo (температура, вологість, VPD)
@@ -1895,45 +2089,92 @@ function computeAndDisplayAgroIndex() {
         ));
     }
 
-    // 2. Валютний фактор — реальний офіційний курс НБУ та його реальна динаміка за 7 днів
-    //    (стабільна гривня = спокійний ціновий фон для аграріїв)
+    // 2. Ґрунт — реальна вологість 9-27см + температура 6см (Open-Meteo)
+    let soilScore = null;
+    if (s.soilMoisture != null) {
+        soilScore = Math.min(100, Math.max(0, (s.soilMoisture - 0.05) / 0.30 * 100));
+        if (s.soilTemp != null && (s.soilTemp < 5 || s.soilTemp > 30)) {
+            soilScore = Math.max(0, soilScore - 20); // холодний/перегрітий ґрунт — стрес кореневої зони
+        }
+    }
+
+    // 3. ☀️ Сонячна радіація — NASA POWER (супутник), % від кліматичної норми місяця
+    let solarScore = null;
+    const nasa = src.nasa?.data;
+    if (nasa?.radMean != null) {
+        const norm = SOLAR_NORM_UA[new Date().getMonth()] || 8;
+        solarScore = Math.min(100, Math.max(0, (nasa.radMean / norm) * 60));
+    }
+
+    // 4. 🌫️ Повітря/пил — CAMS (пил мкг/м³, AOD, PM2.5)
+    let airScore = null;
+    const air = src.air?.data;
+    if (air && (air.aod != null || air.dust != null || air.pm25 != null)) {
+        airScore = Math.min(100, Math.max(0,
+            100
+            - Math.max(0, (air.dust ?? 0) - 10) * 0.5
+            - Math.max(0, (air.aod ?? 0) - 0.3) * 120
+            - Math.max(0, (air.pm25 ?? 0) - 25) * 1.5
+        ));
+    }
+
+    // 5. 🌊 Повінева небезпека — GloFAS: різкість підняття стоку
+    let floodScore = null;
+    const fl = src.flood?.data;
+    if (fl) {
+        if (fl.fcMax == null || fl.fcMax < 0.1) {
+            floodScore = 95; // стоку на клітинці майже нема — загрози немає
+        } else {
+            const base = Math.max(fl.pastMax ?? 0, 0.05);
+            const ratio = fl.fcMax / base;
+            floodScore = Math.min(100, Math.max(20, 100 - (ratio - 1) * 25));
+        }
+    }
+
+    // 6. 💱 Валютний фактор — НБУ: динаміка 7д + реальна волатильність 30д
     let currencyScore = null;
     const usd = globalState.nbuRates?.USD ?? null;
     const usdPrev = globalState.nbuPrev?.USD ?? null;
     if (usd != null && usdPrev != null) {
         const chg = Math.abs((usd - usdPrev) / usdPrev * 100);
-        currencyScore = Math.min(100, Math.max(20, 85 - chg * 25));
+        let vol30 = null;
+        const hs = globalState.nbuHistorySeries?.USD;
+        if (Array.isArray(hs) && hs.length >= 3) {
+            vol30 = (Math.max(...hs) - Math.min(...hs)) / Math.min(...hs) * 100;
+        }
+        currencyScore = Math.min(100, Math.max(20, 85 - chg * 25 - (vol30 != null ? Math.max(0, vol30 - 1) * 20 : 0)));
     }
 
-    // 3. Стан вегетації — довідковий NDVI (Sentinel-2) по поточній зоні
+    // 7. 🏛️ Агро-макро — World Bank: виробництво зернових, останній рік проти попереднього
+    let macroScore = null;
+    const wb = src.wb?.data;
+    if (wb?.cerealYoY != null) {
+        macroScore = Math.min(100, Math.max(10, 50 + wb.cerealYoY * 150));
+    }
+
+    // 8. 🌾 Стан вегетації — довідковий NDVI (Sentinel-2) по поточній зоні
     let vegScore = ndvi != null ? Math.min(100, Math.max(0, ndvi * 100)) : null;
 
-    // Компоненти: якщо реальних даних немає — показуємо «—», нічого не вигадуємо
     const comps = [
-        { score: climateScore,  weight: 0.35, bar: 'idx-bar-climate',  val: 'idx-val-climate' },
-        { score: currencyScore, weight: 0.30, bar: 'idx-bar-currency', val: 'idx-val-currency' },
-        { score: vegScore,      weight: 0.35, bar: 'idx-bar-veg',      val: 'idx-val-veg' }
+        { key: 'climate',  score: climateScore,  weight: 0.20, icon: '🌡️', label: 'Агроклімат',    srcName: 'Open-Meteo' },
+        { key: 'soil',     score: soilScore,     weight: 0.12, icon: '🌱', label: 'Ґрунт',         srcName: 'Open-Meteo' },
+        { key: 'solar',    score: solarScore,    weight: 0.10, icon: '☀️', label: 'Радіація',      srcName: 'NASA POWER' },
+        { key: 'air',      score: airScore,      weight: 0.06, icon: '🌫️', label: 'Повітря/пил',   srcName: 'CAMS Air' },
+        { key: 'flood',    score: floodScore,    weight: 0.05, icon: '🌊', label: 'Річки',         srcName: 'GloFAS' },
+        { key: 'currency', score: currencyScore, weight: 0.20, icon: '💱', label: 'Валюта (НБУ)',  srcName: 'bank.gov.ua' },
+        { key: 'macro',    score: macroScore,    weight: 0.07, icon: '🏛️', label: 'Агро-макро',    srcName: 'World Bank' },
+        { key: 'veg',      score: vegScore,      weight: 0.20, icon: '🌾', label: 'Вегетація',     srcName: 'Sentinel-2 довідк.' }
     ];
 
-    comps.forEach(c => {
-        const barEl = document.getElementById(c.bar);
-        const valEl = document.getElementById(c.val);
-        if (barEl) {
-            if (c.score == null) {
-                barEl.style.width = '0%';
-            } else {
-                barEl.style.width = `${Math.round(c.score)}%`;
-                barEl.style.background = c.score > 60 ? '#00ff95' : c.score > 40 ? '#f59e0b' : '#ef4444';
-            }
-        }
-        if (valEl) valEl.textContent = c.score != null ? Math.round(c.score) : '—';
-    });
+    renderIndexComponents(comps);
 
     const active = comps.filter(c => c.score != null);
     if (active.length === 0) return; // ще немає жодних реальних даних — індекс не рахуємо
 
     const wSum = active.reduce((a, c) => a + c.weight, 0);
     const composite = Math.round(active.reduce((a, c) => a + c.score * c.weight, 0) / wSum);
+    globalState._lastComposite = composite;
+    globalState._lastComps = comps;
 
     // Update gauge SVG arc & text
     const gaugeArcEl = document.getElementById('gauge-value-arc');
@@ -1970,6 +2211,22 @@ function computeAndDisplayAgroIndex() {
     // Update timestamp
     const timeEl = document.getElementById('sitcenter-update-time');
     if (timeEl) timeEl.textContent = new Date().toLocaleTimeString('uk-UA');
+
+    // Широкий AI-звіт під панеллю (алгоритмічний аналіз реальних даних)
+    renderAiSituationReport(comps, composite);
+}
+
+// Динамічний рендер 8 компонентів індексу (замість статичних 3 рядків)
+function renderIndexComponents(comps) {
+    const wrap = document.getElementById('index-components');
+    if (!wrap) return;
+    wrap.innerHTML = comps.map(c => `
+        <div class="idx-comp-row">
+            <span class="idx-comp-lbl">${c.icon} ${c.label}</span>
+            <div class="idx-comp-bar-wrap"><div class="idx-comp-bar" style="width:${c.score != null ? Math.round(c.score) : 0}%;background:${c.score != null ? (c.score > 60 ? '#00ff95' : c.score > 40 ? '#f59e0b' : '#ef4444') : 'rgba(255,255,255,0.15)'}"></div></div>
+            <span class="idx-comp-val">${c.score != null ? Math.round(c.score) : '—'}</span>
+        </div>
+    `).join('');
 }
 
 // Compute SVG arc path for gauge (score 0-100 → 180° arc from left to right)
@@ -1985,6 +2242,215 @@ function computeGaugeArc(score) {
     const largeArc = clamped > 50 ? 1 : 0;
     if (clamped <= 0) return 'M 20 100 A 80 80 0 0 1 20.01 100';
     return `M ${startX.toFixed(2)} ${startY.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${endX.toFixed(2)} ${endY.toFixed(2)}`;
+}
+
+// ==============================================================
+// 9b. AI-СИТУАЦІЯ — широкий ситуативний звіт, згенерований АЛГОРИТМОМ
+//     з live-API (не LLM і не симуляція): кожне речення будується з реальних чисел.
+// ==============================================================
+
+function renderAiSituationReport(comps, composite) {
+    const gridEl = document.getElementById('ai-report-grid');
+    const verdictBadgeEl = document.getElementById('ai-report-verdict-badge');
+    const verdictTextEl = document.getElementById('ai-report-verdict-text');
+    const alertsEl = document.getElementById('ai-report-alerts');
+    const sourcesEl = document.getElementById('ai-report-sources');
+    if (!gridEl) return;
+
+    const s = globalState.lastSensorData || {};
+    const src = globalState.sitSources || {};
+    const region = globalState.currentRegion?.name || 'УКРАЇНА';
+    const ndvi = SAT_REGIONS[currentSatRegion]?.ndvi ?? null;
+    const cells = [];
+
+    // 🌡️ Агроклімат
+    if (s.temperature != null) {
+        const hum = s.humidity ?? null;
+        const vpd = s.vpd ?? null;
+        const ok = s.temperature > 5 && s.temperature < 30 && (hum == null || (hum > 45 && hum < 80));
+        cells.push({
+            icon: '🌡️', title: 'Агроклімат', source: 'Open-Meteo live',
+            values: `${s.temperature > 0 ? '+' : ''}${s.temperature.toFixed(1)}°C · RH ${hum != null ? hum.toFixed(0) : '—'}%${vpd != null ? ` · VPD ${vpd.toFixed(2)} кПа` : ''}${s.et0 != null ? ` · ET₀ ${s.et0.toFixed(2)} мм` : ''}`,
+            verdict: ok
+                ? 'Температурний режим у комфортній зоні для вегетації; випаровуваність під контролем.'
+                : (s.temperature > 30 ? 'Спековий стрес: втрата вологи посилена, потрібен контроль поливів.' : 'Холодно для активної вегетації: ріст уповільнений, ризик заморозків стежимо.')
+        });
+    }
+
+    // 🌱 Ґрунт
+    if (s.soilMoisture != null) {
+        const st = s.soilTemp;
+        let verdict;
+        if (s.soilMoisture < 0.10) verdict = 'Ґрунтова посуха: волога нижче вілтінгового порогу кореневої зони.';
+        else if (s.soilMoisture < 0.18) verdict = 'Волога понижена: техніка ще проходить, але культури починають відчувати дефіцит.';
+        else verdict = 'Запас вологи в кореневій зоні достатній для поточної фази вегетації.';
+        cells.push({
+            icon: '🌱', title: 'Ґрунт', source: 'Open-Meteo live',
+            values: `вологість ${s.soilMoisture.toFixed(2)} m³/m³${st != null ? ` · t ґрунту ${st.toFixed(1)}°C (6 см)` : ''}`,
+            verdict
+        });
+    }
+
+    // ☀️ NASA POWER
+    const nasa = src.nasa?.data;
+    if (nasa?.radMean != null) {
+        const norm = SOLAR_NORM_UA[new Date().getMonth()] || 8;
+        const ratio = nasa.radMean / norm;
+        cells.push({
+            icon: '☀️', title: 'Сонячна радіація', source: 'NASA POWER (супутник)',
+            values: `${nasa.radMean.toFixed(1)} МДж/м²·день · ${Math.round(ratio * 100)}% кліматичної норми · опади ${nasa.precipSum.toFixed(1)} мм/5 дн.`,
+            verdict: ratio >= 1.05
+                ? 'Радіаційний фон вище норми — фотосинтез активний, вегетація не стримана.'
+                : ratio >= 0.7
+                    ? 'Радіація в межах кліматичної норми місяця — ріст іде штатним темпом.'
+                    : 'Дефіцит сонячної радіації (хмарність): ріст сповільнюється, додайте контроль хвороб у вологу погоду.'
+        });
+    }
+
+    // 🌫️ CAMS Air Quality
+    const air = src.air?.data;
+    if (air && (air.aod != null || air.dust != null)) {
+        const aod = air.aod ?? 0, dust = air.dust ?? 0, pm = air.pm25 ?? 0;
+        cells.push({
+            icon: '🌫️', title: 'Повітря та пил', source: 'CAMS Air Quality',
+            values: `пил ${dust.toFixed(0)} мкг/м³ · AOD ${aod.toFixed(2)} · PM2.5 ${pm.toFixed(0)} мкг/м³`,
+            verdict: (aod > 0.7 || dust > 100)
+                ? 'Пилова/димова завіса: обприскування і дрібнокрапельне внесення краще перенести.'
+                : (aod > 0.45 ? 'Аерозоль підвищений: стежте за видимістю при авіа/наземному внесенні.' : 'Повітря чисте — агрохімію можна вносити без аерозольних обмежень.')
+        });
+    }
+
+    // 🌊 GloFAS
+    const fl = src.flood?.data;
+    if (fl) {
+        const base = Math.max(fl.pastMax ?? 0, 0.05);
+        const ratio = fl.fcMax != null ? fl.fcMax / base : null;
+        cells.push({
+            icon: '🌊', title: 'Річки та повені', source: 'GloFAS',
+            values: `стік: макс ${fl.pastMax ?? '—'} м³/с (3 дн.) → прогноз ${fl.fcMax ?? '—'} м³/с${fl.fcMaxDay ? ` (пік ${fl.fcMaxDay})` : ''}`,
+            verdict: (ratio != null && ratio > 2.5 && fl.fcMax >= 0.5)
+                ? `Різке підняття стоку (×${ratio.toFixed(1)}): перевірте польові переїзди та низинні ділянки.`
+                : 'Повеневої загрози на прогнозному вікні GloFAS немає.'
+        });
+    }
+
+    // 💱 НБУ
+    const usd = globalState.nbuRates?.USD ?? null;
+    const usdPrev = globalState.nbuPrev?.USD ?? null;
+    if (usd != null) {
+        const diff = usdPrev != null ? (usd - usdPrev) / usdPrev * 100 : null;
+        const hs = globalState.nbuHistorySeries?.USD;
+        const vol30 = Array.isArray(hs) && hs.length >= 3 ? (Math.max(...hs) - Math.min(...hs)) / Math.min(...hs) * 100 : null;
+        cells.push({
+            icon: '💱', title: 'Валютний фактор', source: 'НБУ (bank.gov.ua)',
+            values: `USD ${usd.toFixed(2)} ₴ · ${diff != null ? `${diff >= 0 ? '+' : ''}${diff.toFixed(2)}% / 7 дн.` : '—'}${vol30 != null ? ` · коридор 30 дн. ${vol30.toFixed(2)}%` : ''}`,
+            verdict: (diff != null && Math.abs(diff) >= 2)
+                ? 'Валютна волатильність: фіксуйте ціни контрактів і строки закупівлі ЗЗР/техніки.'
+                : 'Офіційний курс стабільний: цінове планування на сезон передбачуване.'
+        });
+    }
+
+    // 🏛️ World Bank
+    const wb = src.wb?.data;
+    if (wb?.cerealLast != null) {
+        cells.push({
+            icon: '🏛️', title: 'Агро-макро', source: 'World Bank (річні дані)',
+            values: `зернові ${(wb.cerealLast / 1e6).toFixed(1)} млн т (${wb.cerealYear})${wb.cerealYoY != null ? ` · ${wb.cerealYoY >= 0 ? '+' : ''}${wb.cerealYoY.toFixed(1)}% р/р` : ''}${wb.fert ? ` · добрива ${wb.fert.val.toFixed(0)} кг/га (${wb.fert.year})` : ''}${wb.agriGdp ? ` · АПК ${wb.agriGdp.val.toFixed(1)}% ВВП (${wb.agriGdp.year})` : ''}`,
+            verdict: (wb.cerealYoY ?? 0) >= 0
+                ? 'Останній офіційний рік — виробництво зросло: виробничий потенціал підтверджений.'
+                : 'Останній офіційний рік — спад виробництва: фактор ризику для експортного потенціалу.'
+        });
+    }
+
+    // 🌾 NDVI
+    if (ndvi != null) {
+        cells.push({
+            icon: '🌾', title: 'Вегетація (NDVI)', source: 'Sentinel-2 довідковий',
+            values: `NDVI ${ndvi.toFixed(2)} · зона: ${currentSatRegion === 'all' ? 'вся Україна' : (SAT_REGIONS[currentSatRegion]?.name || '—')}`,
+            verdict: ndvi >= 0.7 ? 'Щільний рослинний покрив — зона у фазі активної вегетації.'
+                : ndvi >= 0.5 ? 'Помірний покрив: культури на початку вегетації або після збирання.'
+                : 'Розріджений покрив: поза вегетацією або стрес посівів.'
+        });
+    }
+
+    if (!cells.length) {
+        gridEl.innerHTML = '<div class="ai-report-cell loading">⏳ Синхронізація джерел…</div>';
+        return;
+    }
+
+    gridEl.innerHTML = cells.map(c => `
+        <div class="ai-report-cell">
+            <div class="ai-cell-head">
+                <span class="ai-cell-title">${c.icon} ${c.title}</span>
+                <span class="ai-cell-src">${c.source}</span>
+            </div>
+            <div class="ai-cell-values">${c.values}</div>
+            <div class="ai-cell-verdict">${c.verdict}</div>
+        </div>
+    `).join('');
+
+    // Вердикт заголовка
+    if (verdictBadgeEl && verdictTextEl) {
+        if (composite != null) {
+            const v = composite >= 70 ? ['СПРИЯТЛИВО', 'good'] : composite >= 55 ? ['ПОМІРНО СПРИЯТЛИВО', 'good'] : composite >= 40 ? ['НЕЙТРАЛЬНО', 'mid'] : composite >= 25 ? ['НАПРУЖЕНО', 'warn'] : ['НЕСПРИЯТЛИВО', 'bad'];
+            verdictBadgeEl.textContent = v[0];
+            verdictBadgeEl.className = `ai-report-verdict-badge ${v[1]}`;
+            const weakest = [...(comps || [])].filter(c => c.score != null).sort((a, b) => a.score - b.score)[0];
+            const strongest = [...(comps || [])].filter(c => c.score != null).sort((a, b) => b.score - a.score)[0];
+            verdictTextEl.textContent = `Агро-індекс ${composite}/100 для ${region}. Сильна сторона: ${strongest ? strongest.label.toLowerCase() : '—'} (${strongest ? Math.round(strongest.score) : '—'}). Ризик: ${weakest ? weakest.label.toLowerCase() : '—'} (${weakest ? Math.round(weakest.score) : '—'}). Аналіз з ${cells.length} категорій реальних даних.`;
+        } else {
+            verdictBadgeEl.textContent = 'АНАЛІЗ…';
+            verdictBadgeEl.className = 'ai-report-verdict-badge mid';
+            verdictTextEl.textContent = 'Збираю дані з офіційних джерел…';
+        }
+    }
+
+    // Алерти — тільки порогові спрацювання на реальних числах
+    const alerts = [];
+    if (s.temperature != null && s.temperature < 2) alerts.push({ lvl: 'bad', txt: `❄️ Ризик заморозків: ${s.temperature.toFixed(1)}°C` });
+    if (s.temperature != null && s.temperature > 30) alerts.push({ lvl: 'warn', txt: `🔥 Спековий стрес: ${s.temperature.toFixed(1)}°C` });
+    if (s.soilMoisture != null && s.soilMoisture < 0.10) alerts.push({ lvl: 'bad', txt: `🥵 Ґрунтова посуха: ${s.soilMoisture.toFixed(2)} m³/m³` });
+    else if (s.soilMoisture != null && s.soilMoisture < 0.18) alerts.push({ lvl: 'warn', txt: `💧 Волога понижена: ${s.soilMoisture.toFixed(2)} m³/m³` });
+    const air2 = src.air?.data;
+    if (air2 && ((air2.aod ?? 0) > 0.7 || (air2.dust ?? 0) > 100)) alerts.push({ lvl: 'warn', txt: `🌫️ Пилова завіса: AOD ${(air2.aod ?? 0).toFixed(2)}` });
+    if (air2 && (air2.pm25 ?? 0) > 35) alerts.push({ lvl: 'warn', txt: `🫁 Якість повітря: PM2.5 ${(air2.pm25).toFixed(0)} мкг/м³` });
+    if (fl) {
+        const base2 = Math.max(fl.pastMax ?? 0, 0.05);
+        const r2 = fl.fcMax != null ? fl.fcMax / base2 : null;
+        if (r2 != null && r2 > 2.5 && fl.fcMax >= 0.5) alerts.push({ lvl: 'warn', txt: `🌊 Підняття стоку ×${r2.toFixed(1)} (${fl.fcMax?.toFixed(2)} м³/с)` });
+    }
+    if (usd != null && usdPrev != null && Math.abs((usd - usdPrev) / usdPrev * 100) >= 2) {
+        alerts.push({ lvl: 'warn', txt: `💱 Гривня волатильна: ${(usd - usdPrev) / usdPrev * 100 >= 0 ? '+' : ''}${((usd - usdPrev) / usdPrev * 100).toFixed(2)}% / 7 дн.` });
+    }
+    const nasa2 = src.nasa?.data;
+    if (nasa2?.radMean != null) {
+        const norm2 = SOLAR_NORM_UA[new Date().getMonth()] || 8;
+        if (nasa2.radMean / norm2 < 0.5) alerts.push({ lvl: 'info', txt: `☁️ Дефіцит радіації: ${Math.round(nasa2.radMean / norm2 * 100)}% норми` });
+    }
+
+    if (alertsEl) {
+        alertsEl.innerHTML = alerts.length
+            ? `<div class="ai-alerts-title">🚨 АЛЕРТИ ПО РЕАЛЬНИХ ДАНИХ (${alerts.length}):</div>` + alerts.map(a => `<span class="ai-alert-chip ${a.lvl}">${a.txt}</span>`).join('')
+            : '<div class="ai-alerts-title ok">✅ Критичних алертів на реальних даних немає — усі показники в межах порогів.</div>';
+    }
+
+    // Статус джерел
+    if (sourcesEl) {
+        const mk = (name, st, note) => {
+            const dot = st === 'live' ? '<span class="src-dot ok"></span>' : st === 'ref' ? '<span class="src-dot ref"></span>' : '<span class="src-dot off"></span>';
+            return `<span class="ai-src-item">${dot}${name}${note ? ` <em>${note}</em>` : ''}</span>`;
+        };
+        const t = (ts) => ts ? new Date(ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' }) : '';
+        sourcesEl.innerHTML = [
+            mk('НБУ', globalState.nbuLive ? 'live' : 'off', globalState.nbuLive ? t(Date.now()) : 'офлайн'),
+            mk('Open-Meteo', s.temperature != null ? 'live' : 'off', t(Date.now())),
+            mk('NASA POWER', src.nasa?.status ?? 'off', src.nasa?.status === 'live' ? t(src.nasa.ts) : 'офлайн'),
+            mk('CAMS Air', src.air?.status ?? 'off', src.air?.status === 'live' ? t(src.air.ts) : 'офлайн'),
+            mk('GloFAS', src.flood?.status ?? 'off', src.flood?.status === 'live' ? t(src.flood.ts) : 'офлайн'),
+            mk('World Bank', src.wb?.status ?? 'off', src.wb?.status === 'live' ? `річні (${src.wb.data?.cerealYear ?? '—'})` : 'офлайн'),
+            mk('Sentinel-2 NDVI', 'ref', 'довідковий')
+        ].join('');
+    }
 }
 
 function updateAlertCardsFromSensors() {

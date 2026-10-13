@@ -58,7 +58,7 @@
             </a>
             <a href="#sitcenter" class="nav-btn">
                 <span class="nav-icon">🎯</span>
-                <span>СИТУАЦІЙНИЙ ЦЕНТР IbonariumLAB</span>
+                <span>СИТУАЦІЙНИЙ ЦЕНТР</span>
             </a>
             <a href="#precision-farming" class="nav-btn">
                 <span class="nav-icon">🛰️</span>
@@ -158,7 +158,7 @@
                         <span class="icon-sub">📊</span>
                         <div>
                             <h3>АГРО-ІНДЕКС РИНКУ</h3>
-                            <span class="header-micro-sub">Розрахунок лише з реальних даних: Open-Meteo · Sentinel-2 NDVI · курс НБУ</span>
+                            <span class="header-micro-sub">8 компонентів · тільки реальні дані: Open-Meteo · NASA POWER · CAMS Air · GloFAS · World Bank · НБУ · Sentinel-2 NDVI (довідковий)</span>
                         </div>
                     </div>
                     <div class="agro-index-gauge-wrap">
@@ -184,22 +184,12 @@
                             <div class="agro-index-trend" id="agro-trend">динаміка НБУ синхронізується...</div>
                         </div>
                     </div>
-                    <!-- Component bars -->
-                    <div class="index-components">
+                    <!-- Component bars — рендеряться з app.js (8 реальних компонентів) -->
+                    <div class="index-components" id="index-components">
                         <div class="idx-comp-row">
-                            <span class="idx-comp-lbl">🌡️ Агрокліматичний</span>
-                            <div class="idx-comp-bar-wrap"><div class="idx-comp-bar" id="idx-bar-climate" style="width:72%;background:#00ff95"></div></div>
-                            <span class="idx-comp-val" id="idx-val-climate">72</span>
-                        </div>
-                        <div class="idx-comp-row">
-                            <span class="idx-comp-lbl">💱 Курс USD (НБУ)</span>
-                            <div class="idx-comp-bar-wrap"><div class="idx-comp-bar" id="idx-bar-currency" style="width:58%;background:#f59e0b"></div></div>
-                            <span class="idx-comp-val" id="idx-val-currency">—</span>
-                        </div>
-                        <div class="idx-comp-row">
-                            <span class="idx-comp-lbl">🌾 Стан вегетації</span>
-                            <div class="idx-comp-bar-wrap"><div class="idx-comp-bar" id="idx-bar-veg" style="width:74%;background:#00ff95"></div></div>
-                            <span class="idx-comp-val" id="idx-val-veg">74</span>
+                            <span class="idx-comp-lbl">🌡️ Агроклімат</span>
+                            <div class="idx-comp-bar-wrap"><div class="idx-comp-bar" id="idx-bar-climate" style="width:0%"></div></div>
+                            <span class="idx-comp-val" id="idx-val-climate">—</span>
                         </div>
                     </div>
                     <div class="index-updated-row">
@@ -278,6 +268,27 @@
                         </div>
                     </div>
                 </div>
+            </div>
+
+            <!-- WIDE: AI-СИТУАЦІЯ — ситуативний звіт, згенерований алгоритмом з реальних API -->
+            <div class="panel-box ai-report-panel" id="ai-report-panel">
+                <div class="panel-header">
+                    <span class="icon-sub">🤖</span>
+                    <div>
+                        <h3>AI-СИТУАЦІЯ — СИТУАТИВНИЙ ЗВІТ</h3>
+                        <span class="header-micro-sub">Звіт генерує алгоритм з live-API без симуляцій · кожне число перевіряється в джерелі</span>
+                    </div>
+                    <span class="badge-status-sat" style="margin-left:auto">ЛИШЕ РЕАЛЬНІ ДАНІ</span>
+                </div>
+                <div class="ai-report-verdict-row" id="ai-report-verdict">
+                    <span class="ai-report-verdict-badge" id="ai-report-verdict-badge">АНАЛІЗ…</span>
+                    <span class="ai-report-verdict-text" id="ai-report-verdict-text">Збираю дані з офіційних джерел: Open-Meteo · NASA POWER · CAMS Air Quality · GloFAS · World Bank · НБУ…</span>
+                </div>
+                <div class="ai-report-grid" id="ai-report-grid">
+                    <div class="ai-report-cell loading">⏳ Синхронізація джерел…</div>
+                </div>
+                <div class="ai-report-alerts" id="ai-report-alerts"></div>
+                <div class="ai-report-sources" id="ai-report-sources"></div>
             </div>
 
             <!-- Bottom: Alert timeline / event log -->
