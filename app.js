@@ -230,24 +230,21 @@ async function fetchNbuRates() {
         // Журнал подій — реальна синхронізація з офіційним API (дедуплікація за текстом)
         addEventLog('ok', `<strong>Курси НБУ синхронізовано (bank.gov.ua):</strong> USD=${globalState.nbuRates.USD} ₴ · EUR=${globalState.nbuRates.EUR} ₴ · PLN=${globalState.nbuRates.PLN} ₴`);
 
-        // Реальна історія курсів НБУ (динаміка 7 днів + спарклайн) — у фоні, раз за сесію
+        // Реальна історія курсів НБУ (динаміка 7 днів у стрічці) — у фоні, раз за сесію
         fetchNbuHistory().then(() => {
             renderTicker();
-            renderNbuCards();
             computeAndDisplayAgroIndex();
         });
 
         console.log('[NBU API] Synced live rates:', globalState.nbuRates);
         renderTractorCatalog(); // Update converted UAH prices in the shop
         renderTicker();
-        renderNbuCards();
     } catch (e) {
         console.warn('[NBU API] Offline fallback:', e.message);
         if (!globalState.nbuLive) {
             addEventLog('warn', "<strong>НБУ API недоступний.</strong> Офіційні курси не відображаються, поки зв'язок не відновлено");
         }
         renderTicker();
-        renderNbuCards();
     }
 }
 
@@ -297,7 +294,7 @@ async function fetchNbuHistory() {
 }
 
 // ==============================================================
-// 5. TICKER & OFFICIAL NBU CARDS (ONLY REAL DATA — NO SIMULATION)
+// 5. TICKER (ONLY REAL DATA — NO SIMULATION)
 //    Єдине ринкове джерело, яке доступне з браузера без CORS-блокування
 //    і без серверного ключа — офіційний API НБУ (bank.gov.ua).
 //    Біржові котирування (CBOT/Matif/нафта/СРТ) не показуємо взагалі.
@@ -349,61 +346,15 @@ function renderTicker() {
     tickerContainer.innerHTML = joined + joined;
 }
 
-// Офіційні курси НБУ — картки з реальною динамікою за 7 днів та спарклайнами з реальної історії НБУ
-function renderNbuCards() {
-    const container = document.getElementById('analytics-widgets-container');
-    if (!container) return;
-
-    const nbu = globalState.nbuRates;
-    const series = globalState.nbuHistorySeries;
-
-    const cards = [
-        { code: 'USD', name: 'Долар США', flag: '🇺🇸', val: nbu.USD, series: series?.USD },
-        { code: 'EUR', name: 'Євро', flag: '🇪🇺', val: nbu.EUR, series: series?.EUR },
-        { code: 'PLN', name: 'Злотий (PLN)', flag: '🇵🇱', val: nbu.PLN, series: series?.PLN }
-    ];
-
-    container.innerHTML = cards.map(c => {
-        let diffHtml;
-        if (!globalState.nbuLive) {
-            diffHtml = '<span class="kpi-diff text-red">НБУ API недоступний</span>';
-        } else if (globalState.nbuPrev?.[c.code] != null) {
-            const diff = (c.val - globalState.nbuPrev[c.code]) / globalState.nbuPrev[c.code] * 100;
-            diffHtml = `<span class="kpi-diff ${diff >= 0 ? 'text-green' : 'text-red'}">${diff >= 0 ? '+' : ''}${diff.toFixed(2)}% / 7 днів</span>`;
-        } else {
-            diffHtml = '<span class="kpi-diff">офіційний курс</span>';
-        }
-
-        // Спарклайн — ТІЛЬКИ з реальної історії курсів НБУ; якщо історії немає, блок не малюємо (без вигаданих даних)
-        let sparkHtml = '';
-        if (Array.isArray(c.series) && c.series.length >= 2) {
-            const min = Math.min(...c.series);
-            const max = Math.max(...c.series);
-            const range = (max - min) || 1;
-            sparkHtml = `
-                <div class="sparkline-box">
-                    ${c.series.map(v => `<div class="spark-bar" style="height: ${Math.round(35 + ((v - min) / range) * 60)}%"></div>`).join('')}
-                </div>`;
-        }
-
-        return `
-            <div class="kpi-card">
-                <div class="kpi-top">
-                    <span class="kpi-label">${c.flag} ${c.name} · НБУ</span>
-                    ${diffHtml}
-                </div>
-                <div class="kpi-val-row">
-                    <span class="kpi-val">${globalState.nbuLive ? c.val.toFixed(2) + ' ₴' : '— ₴'}</span>
-                    ${sparkHtml}
-                </div>
-            </div>
-        `;
-    }).join('');
-}
+// Офіційні курси НБУ — картки з реальною динамікою видалено разом з правою
+// колонкою «Курси НБУ та Джерела Даних» (аналітичний блок порожній без даних).
+// Тікер і Агро-індекс далі живуть на тому самому live API НБУ.
 
 // ==============================================================
 
 // 6. 24-HOUR LIVE NEWS ENGINE (UA & EN, NO STUBS)
+//    EN-стрічка: автопереклад заголовків українською (Google Translate,
+//    безкоштовний публічний ендпоінт, CORS дозволено). Кеш у localStorage.
 // ==============================================================
 
 async function fetchNewsFeeds() {
@@ -463,6 +414,15 @@ function renderNewsFeed(lang, items) {
         const timeStr = lang === 'ua' ? formatHoursAgo(it.hours_ago) : formatHoursAgoEn(it.hours_ago);
         const safeLink = encodeURI(it.link || '#');
 
+        // EN-стрічка: одразу показуємо кешований переклад або плейсхолдер «переклад…»
+        let translationHtml = '';
+        if (lang === 'en') {
+            const cached = getCachedTranslation(it.title);
+            translationHtml = cached
+                ? `<div class="news-translation">🇺🇦 ${escapeNewsHtml(cached)}</div>`
+                : `<div class="news-translation news-translation-pending" data-tr-title="${escapeNewsHtml(it.title)}"><span class="tr-dot"></span>переклад…</div>`;
+        }
+
         return `
             <a href="${safeLink}" target="_blank" rel="noopener noreferrer" class="news-card-item">
                 <div class="news-item-top">
@@ -470,6 +430,7 @@ function renderNewsFeed(lang, items) {
                     <span class="news-category-tag">${it.category || 'NEWS'}</span>
                 </div>
                 <div class="news-headline">${it.title}</div>
+                ${translationHtml}
                 <div class="news-source-row">
                     <span class="news-source-name">📰 <strong>${it.source}</strong></span>
                     <span class="news-read-link">Читати в джерелі &rarr;</span>
@@ -477,6 +438,130 @@ function renderNewsFeed(lang, items) {
             </a>
         `;
     }).join('');
+
+    // Запускаємо дозавантаження перекладів для нових (некешованих) заголовків
+    if (lang === 'en') queuePendingTranslations(container);
+}
+
+// ==============================================================
+// 6a. AUTOTRANSLATOR: EN HEADLINES → UKRAINIAN (GOOGLE TRANSLATE, FREE ENDPOINT)
+//     - Безкоштовний публічний ендпоінт translate.googleapis.com (CORS дозволено),
+//       резервний clients5.google.com — обидва без API-ключа.
+//     - Кеш у localStorage: переклад заголовка не міняється, тому живе довго.
+//     - Автооновлення стрічки кожні 60с НЕ створює повторних запитів (усе з кешу).
+//     - Якщо переклад недоступний — показуємо оригінальний заголовок (без фейків).
+// ==============================================================
+
+const TRANSLATE_CACHE_KEY = 'agro_tr_en_uk_v1';
+const TRANSLATE_CACHE_MAX = 300;
+const TRANSLATE_CONCURRENCY = 5;
+let _translateCache = null;
+let _translateQueue = [];
+let _translateActive = 0;
+const _translateSeen = new Set(); // дедуплікація однакових заголовків у черзі
+
+function escapeNewsHtml(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function loadTranslateCache() {
+    if (_translateCache) return _translateCache;
+    try {
+        _translateCache = JSON.parse(localStorage.getItem(TRANSLATE_CACHE_KEY) || '{}');
+        if (typeof _translateCache !== 'object' || !_translateCache) _translateCache = {};
+    } catch (e) {
+        _translateCache = {};
+    }
+    return _translateCache;
+}
+
+function saveTranslateCache() {
+    try {
+        const keys = Object.keys(_translateCache);
+        if (keys.length > TRANSLATE_CACHE_MAX) {
+            keys.sort((a, b) => (_translateCache[a]?.ts || 0) - (_translateCache[b]?.ts || 0))
+                .slice(0, keys.length - TRANSLATE_CACHE_MAX)
+                .forEach(k => delete _translateCache[k]);
+        }
+        localStorage.setItem(TRANSLATE_CACHE_KEY, JSON.stringify(_translateCache));
+    } catch (e) { /* приватний режим / переповнений localStorage — працюємо без кешу */ }
+}
+
+function getCachedTranslation(enTitle) {
+    const entry = loadTranslateCache()[enTitle];
+    return entry && typeof entry.uk === 'string' ? entry.uk : null;
+}
+
+// Переклад одного заголовка: основний ендпоінт + резервний
+async function fetchTranslationUk(enTitle) {
+    const primary = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=uk&dt=t&q=${encodeURIComponent(enTitle)}`;
+    const fallback = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=uk&q=${encodeURIComponent(enTitle)}`;
+
+    try {
+        const res = await fetch(primary);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        const uk = Array.isArray(j?.[0]) ? j[0].map(s => s?.[0] || '').join('').trim() : '';
+        if (uk) return uk;
+        throw new Error('порожня відповідь');
+    } catch (e) {
+        try {
+            const res2 = await fetch(fallback);
+            if (!res2.ok) throw new Error(`HTTP ${res2.status}`);
+            const j2 = await res2.json();
+            let uk2 = '';
+            if (Array.isArray(j2)) {
+                uk2 = typeof j2[0] === 'string' ? j2[0] : (typeof j2[0]?.[0] === 'string' ? j2[0][0] : '');
+            } else if (Array.isArray(j2?.sentences)) {
+                uk2 = j2.sentences.map(s => s.trans || '').join('');
+            }
+            uk2 = String(uk2).trim();
+            return uk2 || null;
+        } catch (e2) {
+            console.warn('[TRANSLATOR] EN headline not translated:', e2.message);
+            return null;
+        }
+    }
+}
+
+// Зібрати всі некешовані заголовки з поточного рендера в чергу перекладу
+function queuePendingTranslations(container) {
+    container.querySelectorAll('.news-translation-pending').forEach(el => {
+        const title = el.dataset.trTitle;
+        if (!title || _translateSeen.has(title)) return;
+        _translateSeen.add(title);
+        _translateQueue.push({ title, el });
+    });
+    pumpTranslationQueue();
+}
+
+function pumpTranslationQueue() {
+    while (_translateActive < TRANSLATE_CONCURRENCY && _translateQueue.length) {
+        const job = _translateQueue.shift();
+        _translateActive++;
+        (async () => {
+            const uk = await fetchTranslationUk(job.title);
+            _translateActive--;
+            _translateSeen.delete(job.title);
+
+            if (uk) {
+                const cache = loadTranslateCache();
+                cache[job.title] = { uk, ts: Date.now() };
+                saveTranslateCache();
+                // елемент міг зникнути після повторного рендера (фільтр/автооновлення) — тоді переклад підхопиться з кешу
+                if (job.el.isConnected) {
+                    job.el.classList.remove('news-translation-pending');
+                    job.el.removeAttribute('data-tr-title');
+                    job.el.innerHTML = `🇺🇦 ${escapeNewsHtml(uk)}`;
+                }
+            } else if (job.el.isConnected) {
+                job.el.remove(); // без перекладу лишаємо тільки оригінальний заголовок
+            }
+            pumpTranslationQueue();
+        })();
+    }
 }
 
 function filterNews(lang, filterCategory, btnEl) {
